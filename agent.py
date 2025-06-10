@@ -1,455 +1,577 @@
-# GitLab-Jira Integration Agent using Google ADK
-# Step-by-step implementation with setup requirements
-
 """
-SETUP REQUIREMENTS:
+GitLab PR & Jira Integration Agent using Google ADK
 
-1. GitLab Setup:
-   - Go to GitLab → User Settings → Access Tokens
-   - Create a Personal Access Token with scopes:
-     * api (full API access)
-     * read_user
-     * read_repository
-   - Note down the token
+This agent:
+1. Fetches PR requests from GitLab
+2. Checks if PRs are approved
+3. Merges approved PRs
+4. Updates corresponding Jira tickets
 
-2. Jira Setup:
-   - Go to Jira → Profile → Personal Access Tokens (or Account Settings → Security → API tokens)
-   - Create an API token
-   - Note down your Jira email and token
-   - Note your Jira base URL (e.g., https://yourcompany.atlassian.net)
-
-3. Google AI Studio Setup:
-   - Go to https://aistudio.google.com/
-   - Create an API key
-   - Note down the API key
-
-4. Environment Setup:
-   pip install google-adk requests python-dotenv
-
-5. Create .env file:
-   GITLAB_TOKEN=your_gitlab_token
-   GITLAB_BASE_URL=https://gitlab.com/api/v4  # or your GitLab instance URL
-   JIRA_EMAIL=your_jira_email
-   JIRA_TOKEN=your_jira_token
-   JIRA_BASE_URL=https://yourcompany.atlassian.net
-   GOOGLE_API_KEY=your_google_api_key
+Requirements:
+pip install google-adk requests python-dotenv
 """
 
 import os
-import requests
 import json
+import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
+from datetime import datetime
+
+import requests
 from dotenv import load_dotenv
-import base64
+load_dotenv()
+
+# Google ADK imports
+from google.adk.agents import LlmAgent
+from google.adk.tools.base_toolset import BaseToolset
+from google.adk.tools import FunctionTool
 
 # Load environment variables
 load_dotenv()
 
-# Google ADK imports
-from google.adk.agents import Agent
-from google.adk.tools import BaseTool
-import google.generativeai as genai
+# Google AI Studio API Key
+GOOGLE_API_KEY=os.getenv('GOOGLE_API_KEY')
+
+# GitLab Configuration
+GITLAB_BASE_URL=os.getenv('GITLAB_BASE_URL')
+GITLAB_TOKEN=os.getenv('GITLAB_TOKEN')
+GITLAB_PROJECT_ID=os.getenv('GITLAB_PROJECT_ID')
+
+# Jira Configuration
+JIRA_BASE_URL=os.getenv('JIRA_BASE_URL')
+JIRA_EMAIL=os.getenv('JIRA_EMAIL')
+JIRA_API_TOKEN=os.getenv('JIRA_API_TOKEN')
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @dataclass
-class GitLabConfig:
-    base_url: str
-    token: str
+class PRInfo:
+    """Data structure for PR information"""
+    id: int
+    title: str
+    description: str
+    state: str
+    merge_status: str
+    source_branch: str
+    target_branch: str
+    author: str
+    web_url: str
+    approvals: List[str]
+    jira_ticket: Optional[str] = None
 
 @dataclass
-class JiraConfig:
-    base_url: str
-    email: str
-    token: str
+class JiraTicket:
+    """Data structure for Jira ticket information"""
+    key: str
+    summary: str
+    status: str
+    assignee: str
 
-class GitLabService:
-    def __init__(self, config: GitLabConfig):
-        self.config = config
+class GitLabToolkit(BaseToolset):
+    """Toolkit for GitLab operations"""
+    
+    def __init__(self, base_url: str, token: str, project_id: str):
+        super().__init__()
+        self.base_url = base_url.rstrip('/')
+        self.token = token
+        self.project_id = project_id
         self.headers = {
-            'Authorization': f'Bearer {config.token}',
-            'Content-Type': 'application/json'
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
         }
     
-    def fetch_merge_request(self, project_id: str, mr_iid: str) -> Dict[str, Any]:
-        """Fetch merge request details"""
-        url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+    def get_tools(self):
+        """Return the tools provided by this toolset"""
+        return [
+            FunctionTool(self.fetch_merge_requests),
+            FunctionTool(self.get_merge_request_approvals),
+            FunctionTool(self.merge_request),
+            FunctionTool(self.extract_jira_ticket_from_branch),
+        ]
     
-    def get_merge_request_diff(self, project_id: str, mr_iid: str) -> List[Dict[str, Any]]:
-        """Get merge request diff using Merge Request Diff API"""
-        url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}/diffs"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+    def close(self):
+        """Clean up resources (no resources to clean up for this toolkit)"""
+        pass
     
-    def get_merge_request_changes(self, project_id: str, mr_iid: str) -> Dict[str, Any]:
-        """Get detailed changes in merge request"""
-        url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}/changes"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
+    def fetch_merge_requests(self, state: str = "opened") -> List[Dict]:
+        """
+        Fetch merge requests from GitLab
+        
+        Args:
+            state: The state of merge requests to fetch (opened, closed, merged)
+            
+        Returns:
+            List of merge request dictionaries
+        """
+        try:
+            url = f"{self.base_url}/api/v4/projects/{self.project_id}/merge_requests"
+            params = {'state': state, 'per_page': 100}
+            
+            response = requests.get(url, headers=self.headers, params=params)
+            response.raise_for_status()
+            
+            mrs = response.json()
+            logger.info(f"Fetched {len(mrs)} merge requests")
+            return mrs
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching merge requests: {e}")
+            return []
     
-    def update_merge_request_status(self, project_id: str, mr_iid: str, action: str) -> Dict[str, Any]:
-        """Update merge request status (merge, close, reopen)"""
-        if action == "merge":
-            url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}/merge"
-            response = requests.put(url, headers=self.headers)
-        elif action == "close":
-            url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}"
-            data = {"state_event": "close"}
+    def get_merge_request_approvals(self, mr_iid: int) -> Dict:
+        """
+        Get approvals for a specific merge request
+        
+        Args:
+            mr_iid: The IID of the merge request
+            
+        Returns:
+            Dictionary containing approval information
+        """
+        try:
+            url = f"{self.base_url}/api/v4/projects/{self.project_id}/merge_requests/{mr_iid}/approvals"
+            
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            approvals = response.json()
+            logger.info(f"Fetched approvals for MR {mr_iid}")
+            return approvals
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching approvals for MR {mr_iid}: {e}")
+            return {}
+    
+    def merge_request(self, mr_iid: int, commit_message: str = None) -> Dict:
+        """
+        Merge a specific merge request
+        
+        Args:
+            mr_iid: The IID of the merge request to merge
+            commit_message: Optional commit message for the merge
+            
+        Returns:
+            Dictionary containing merge result
+        """
+        try:
+            url = f"{self.base_url}/api/v4/projects/{self.project_id}/merge_requests/{mr_iid}/merge"
+            
+            data = {}
+            if commit_message:
+                data['merge_commit_message'] = commit_message
+            
             response = requests.put(url, headers=self.headers, json=data)
-        elif action == "reopen":
-            url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}"
-            data = {"state_event": "reopen"}
-            response = requests.put(url, headers=self.headers, json=data)
-        else:
-            raise ValueError(f"Invalid action: {action}")
+            response.raise_for_status()
+            
+            result = response.json()
+            logger.info(f"Successfully merged MR {mr_iid}")
+            return result
+            
+        except requests.RequestException as e:
+            logger.error(f"Error merging MR {mr_iid}: {e}")
+            return {"error": str(e)}
+    
+    def extract_jira_ticket_from_branch(self, branch_name: str) -> Optional[str]:
+        """
+        Extract Jira ticket key from branch name
         
-        response.raise_for_status()
-        return response.json()
-    
-    def approve_merge_request(self, project_id: str, mr_iid: str) -> Dict[str, Any]:
-        """Approve merge request"""
-        url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}/approve"
-        response = requests.post(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-    
-    def unapprove_merge_request(self, project_id: str, mr_iid: str) -> Dict[str, Any]:
-        """Unapprove merge request"""
-        url = f"{self.config.base_url}/projects/{project_id}/merge_requests/{mr_iid}/unapprove"
-        response = requests.post(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-
-class JiraService:
-    def __init__(self, config: JiraConfig):
-        self.config = config
-        # Create basic auth header
-        auth_string = f"{config.email}:{config.token}"
-        encoded_auth = base64.b64encode(auth_string.encode()).decode()
-        self.headers = {
-            'Authorization': f'Basic {encoded_auth}',
-            'Content-Type': 'application/json'
-        }
-    
-    def fetch_issue(self, issue_key: str) -> Dict[str, Any]:
-        """Fetch Jira issue details"""
-        url = f"{self.config.base_url}/rest/api/3/issue/{issue_key}"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()
-    
-    def update_issue_status(self, issue_key: str, transition_id: str) -> Dict[str, Any]:
-        """Update Jira issue status using transition"""
-        url = f"{self.config.base_url}/rest/api/3/issue/{issue_key}/transitions"
-        data = {
-            "transition": {
-                "id": transition_id
-            }
-        }
-        response = requests.post(url, headers=self.headers, json=data)
-        response.raise_for_status()
-        return {"success": True, "message": f"Issue {issue_key} status updated"}
-    
-    def get_issue_transitions(self, issue_key: str) -> List[Dict[str, Any]]:
-        """Get available transitions for an issue"""
-        url = f"{self.config.base_url}/rest/api/3/issue/{issue_key}/transitions"
-        response = requests.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.json()["transitions"]
-    
-    def add_comment(self, issue_key: str, comment: str) -> Dict[str, Any]:
-        """Add comment to Jira issue"""
-        url = f"{self.config.base_url}/rest/api/3/issue/{issue_key}/comment"
-        data = {
-            "body": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": comment
-                            }
-                        ]
-                    }
-                ]
-            }
-        }
-        response = requests.post(url, headers=self.headers, json=data)
-        response.raise_for_status()
-        return response.json()
-
-# Custom Tool Classes
-class FetchGitLabMRTool(BaseTool):
-    def __init__(self, gitlab_service):
-        super().__init__()
-        self.gitlab_service = gitlab_service
-        self.name = "fetch_gitlab_mr"
-        self.description = "Fetch GitLab merge request details"
-    
-    def run(self, project_id: str, mr_iid: str) -> str:
-        """Fetch GitLab merge request details"""
-        try:
-            mr_data = self.gitlab_service.fetch_merge_request(project_id, mr_iid)
-            return f"Merge Request #{mr_iid} fetched successfully:\n" + \
-                   f"Title: {mr_data['title']}\n" + \
-                   f"State: {mr_data['state']}\n" + \
-                   f"Author: {mr_data['author']['name']}\n" + \
-                   f"Source Branch: {mr_data['source_branch']}\n" + \
-                   f"Target Branch: {mr_data['target_branch']}\n" + \
-                   f"Description: {mr_data.get('description', 'No description')}"
-        except Exception as e:
-            return f"Error fetching merge request: {str(e)}"
-
-class GetMRDiffTool(BaseTool):
-    def __init__(self, gitlab_service):
-        super().__init__()
-        self.gitlab_service = gitlab_service
-        self.name = "get_mr_diff"
-        self.description = "Get merge request diff for code comparison"
-    
-    def run(self, project_id: str, mr_iid: str) -> str:
-        """Get merge request diff for code comparison"""
-        try:
-            diff_data = self.gitlab_service.get_merge_request_diff(project_id, mr_iid)
-            changes_data = self.gitlab_service.get_merge_request_changes(project_id, mr_iid)
+        Args:
+            branch_name: The name of the branch
             
-            summary = f"Merge Request #{mr_iid} Changes:\n"
-            summary += f"Files changed: {len(changes_data.get('changes', []))}\n\n"
-            
-            for change in changes_data.get('changes', [])[:5]:  # Limit to first 5 files
-                summary += f"File: {change['new_path']}\n"
-                summary += f"  - Additions: +{change.get('additions', 0)}\n"
-                summary += f"  - Deletions: -{change.get('deletions', 0)}\n"
-                if change.get('diff'):
-                    # Show first few lines of diff
-                    diff_lines = change['diff'].split('\n')[:10]
-                    summary += f"  - Preview:\n    " + "\n    ".join(diff_lines) + "\n\n"
-            
-            return summary
-        except Exception as e:
-            return f"Error fetching merge request diff: {str(e)}"
-
-class UpdateMRStatusTool(BaseTool):
-    def __init__(self, gitlab_service):
-        super().__init__()
-        self.gitlab_service = gitlab_service
-        self.name = "update_mr_status"
-        self.description = "Update merge request status (approve/unapprove/merge/close/reopen)"
-    
-    def run(self, project_id: str, mr_iid: str, action: str) -> str:
-        """Update merge request status (approve/unapprove/merge/close/reopen)"""
-        try:
-            if action in ["approve", "unapprove"]:
-                if action == "approve":
-                    result = self.gitlab_service.approve_merge_request(project_id, mr_iid)
-                else:
-                    result = self.gitlab_service.unapprove_merge_request(project_id, mr_iid)
-            else:
-                result = self.gitlab_service.update_merge_request_status(project_id, mr_iid, action)
-            
-            return f"Merge request #{mr_iid} {action} successful"
-        except Exception as e:
-            return f"Error updating merge request status: {str(e)}"
-
-class FetchJiraTicketTool(BaseTool):
-    def __init__(self, jira_service):
-        super().__init__()
-        self.jira_service = jira_service
-        self.name = "fetch_jira_ticket"
-        self.description = "Fetch Jira ticket details"
-    
-    def run(self, issue_key: str) -> str:
-        """Fetch Jira ticket details"""
-        try:
-            issue_data = self.jira_service.fetch_issue(issue_key)
-            fields = issue_data['fields']
-            
-            return f"Jira Ticket {issue_key} fetched successfully:\n" + \
-                   f"Summary: {fields['summary']}\n" + \
-                   f"Status: {fields['status']['name']}\n" + \
-                   f"Priority: {fields.get('priority', {}).get('name', 'Not set')}\n" + \
-                   f"Assignee: {fields.get('assignee', {}).get('displayName', 'Unassigned')}\n" + \
-                   f"Description: {fields.get('description', 'No description')}"
-        except Exception as e:
-            return f"Error fetching Jira ticket: {str(e)}"
-
-class UpdateJiraStatusTool(BaseTool):
-    def __init__(self, jira_service):
-        super().__init__()
-        self.jira_service = jira_service
-        self.name = "update_jira_status"
-        self.description = "Update Jira ticket status"
-    
-    def run(self, issue_key: str, status_name: str) -> str:
-        """Update Jira ticket status"""
-        try:
-            # Get available transitions
-            transitions = self.jira_service.get_issue_transitions(issue_key)
-            
-            # Find the transition ID for the desired status
-            transition_id = None
-            for transition in transitions:
-                if transition['to']['name'].lower() == status_name.lower():
-                    transition_id = transition['id']
-                    break
-            
-            if transition_id:
-                result = self.jira_service.update_issue_status(issue_key, transition_id)
-                return f"Jira ticket {issue_key} status updated to {status_name}"
-            else:
-                available_statuses = [t['to']['name'] for t in transitions]
-                return f"Status '{status_name}' not available. Available statuses: {', '.join(available_statuses)}"
-        except Exception as e:
-            return f"Error updating Jira ticket status: {str(e)}"
-
-class AddJiraCommentTool(BaseTool):
-    def __init__(self, jira_service):
-        super().__init__()
-        self.jira_service = jira_service
-        self.name = "add_jira_comment"
-        self.description = "Add comment to Jira ticket"
-    
-    def run(self, issue_key: str, comment: str) -> str:
-        """Add comment to Jira ticket"""
-        try:
-            result = self.jira_service.add_comment(issue_key, comment)
-            return f"Comment added to Jira ticket {issue_key} successfully"
-        except Exception as e:
-            return f"Error adding comment to Jira ticket: {str(e)}"
-
-class GitLabJiraAgent:
-    def __init__(self):
-        # Initialize configurations
-        self.gitlab_config = GitLabConfig(
-            base_url=os.getenv('GITLAB_BASE_URL'),
-            token=os.getenv('GITLAB_TOKEN')
-        )
+        Returns:
+            Jira ticket key if found, None otherwise
+        """
+        import re
         
-        self.jira_config = JiraConfig(
-            base_url=os.getenv('JIRA_BASE_URL'),
-            email=os.getenv('JIRA_EMAIL'),
-            token=os.getenv('JIRA_TOKEN')
-        )
-        
-        # Initialize services
-        self.gitlab_service = GitLabService(self.gitlab_config)
-        self.jira_service = JiraService(self.jira_config)
-        
-        # Initialize Gemini
-        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        
-        # Initialize tools
-        self.tools = [
-            FetchGitLabMRTool(self.gitlab_service),
-            GetMRDiffTool(self.gitlab_service),
-            UpdateMRStatusTool(self.gitlab_service),
-            FetchJiraTicketTool(self.jira_service),
-            UpdateJiraStatusTool(self.jira_service),
-            AddJiraCommentTool(self.jira_service)
+        # Common patterns for Jira tickets in branch names
+        patterns = [
+            r'([A-Z]{2,}-\d+)',  # Standard format: ABC-123
+            r'([A-Z]{2,}_\d+)',  # Underscore format: ABC_123
         ]
         
-        # Initialize ADK Agent
-        self.agent = Agent(
-            name="GitLab-Jira Integration Agent",
-            instructions="""
-            You are a GitLab-Jira integration agent that helps manage merge requests and Jira tickets.
-            You can:
-            1. Fetch GitLab merge requests and their diffs
-            2. Compare code changes in merge requests
-            3. Update merge request status (approve/unapprove/merge/close)
-            4. Fetch Jira tickets
-            5. Update Jira ticket status
-            6. Add comments to Jira tickets
-            
-            Always provide clear status updates and handle errors gracefully.
-            """,
-            model=self.model,
-            tools=self.tools
-        )
-    
-    def execute_workflow(self, project_id: str, mr_iid: str, jira_issue_key: str):
-        """Execute the complete workflow"""
-        workflow_prompt = f"""
-        Execute the following workflow:
-        1. Fetch GitLab merge request {mr_iid} from project {project_id}
-        2. Get the code diff and analyze changes
-        3. Fetch Jira ticket {jira_issue_key}
-        4. Based on the merge request status and code quality, decide if we should:
-           - Approve the merge request
-           - Update the Jira ticket status appropriately
-           - Add a comment to the Jira ticket with merge request details
+        for pattern in patterns:
+            match = re.search(pattern, branch_name.upper())
+            if match:
+                return match.group(1).replace('_', '-')
         
-        Please execute this workflow step by step and provide status updates.
-        """
-        
-        return self.agent.run(workflow_prompt)
-    
-    def chat(self, message: str):
-        """Chat interface for the agent"""
-        return self.agent.run(message)
+        return None
 
-# Example usage and testing
-def main():
-    """Main function to demonstrate the agent"""
+class JiraToolkit(BaseToolset):
+    """Toolkit for Jira operations"""
     
-    # Initialize the agent
+    def __init__(self, base_url: str, username: str, api_token: str):
+        super().__init__()
+        self.base_url = base_url.rstrip('/')
+        self.username = username
+        self.api_token = api_token
+        self.auth = (username, api_token)
+        self.headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+    
+    def get_tools(self):
+        """Return the tools provided by this toolset"""
+        return [
+            FunctionTool(self.get_ticket_info),
+            FunctionTool(self.update_ticket_status),
+            FunctionTool(self.add_comment),
+        ]
+    
+    def close(self):
+        """Clean up resources (no resources to clean up for this toolkit)"""
+        pass
+    
+    def get_ticket_info(self, ticket_key: str) -> Dict:
+        """
+        Get information about a Jira ticket
+        
+        Args:
+            ticket_key: The key of the Jira ticket (e.g., PROJ-123)
+            
+        Returns:
+            Dictionary containing ticket information
+        """
+        try:
+            url = f"{self.base_url}/rest/api/3/issue/{ticket_key}"
+            
+            response = requests.get(url, auth=self.auth, headers=self.headers)
+            response.raise_for_status()
+            
+            ticket = response.json()
+            logger.info(f"Fetched info for ticket {ticket_key}")
+            return ticket
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching ticket {ticket_key}: {e}")
+            return {}
+    
+    def update_ticket_status(self, ticket_key: str, status: str, comment: str = None) -> Dict:
+        """
+        Update the status of a Jira ticket
+        
+        Args:
+            ticket_key: The key of the Jira ticket
+            status: The new status for the ticket
+            comment: Optional comment to add
+            
+        Returns:
+            Dictionary containing update result
+        """
+        try:
+            # Get available transitions
+            transitions_url = f"{self.base_url}/rest/api/3/issue/{ticket_key}/transitions"
+            transitions_response = requests.get(transitions_url, auth=self.auth, headers=self.headers)
+            transitions_response.raise_for_status()
+            
+            transitions = transitions_response.json()['transitions']
+            target_transition = None
+            
+            for transition in transitions:
+                if transition['to']['name'].lower() == status.lower():
+                    target_transition = transition
+                    break
+            
+            if not target_transition:
+                logger.error(f"Status '{status}' not available for ticket {ticket_key}")
+                return {"error": f"Status '{status}' not available"}
+            
+            # Execute transition
+            transition_data = {
+                "transition": {"id": target_transition['id']}
+            }
+            
+            if comment:
+                transition_data["update"] = {
+                    "comment": [{"add": {"body": comment}}]
+                }
+            
+            response = requests.post(transitions_url, auth=self.auth, 
+                                   headers=self.headers, json=transition_data)
+            response.raise_for_status()
+            
+            logger.info(f"Updated ticket {ticket_key} to status '{status}'")
+            return {"success": True, "status": status}
+            
+        except requests.RequestException as e:
+            logger.error(f"Error updating ticket {ticket_key}: {e}")
+            return {"error": str(e)}
+    
+    def add_comment(self, ticket_key: str, comment: str) -> Dict:
+        """
+        Add a comment to a Jira ticket
+        
+        Args:
+            ticket_key: The key of the Jira ticket
+            comment: The comment text to add
+            
+        Returns:
+            Dictionary containing the result
+        """
+        try:
+            url = f"{self.base_url}/rest/api/3/issue/{ticket_key}/comment"
+            
+            data = {
+                "body": {
+                    "content": [
+                        {
+                            "content": [
+                                {
+                                    "text": comment,
+                                    "type": "text"
+                                }
+                            ],
+                            "type": "paragraph"
+                        }
+                    ],
+                    "type": "doc",
+                    "version": 1
+                }
+            }
+            
+            response = requests.post(url, auth=self.auth, headers=self.headers, json=data)
+            response.raise_for_status()
+            
+            logger.info(f"Added comment to ticket {ticket_key}")
+            return {"success": True}
+            
+        except requests.RequestException as e:
+            logger.error(f"Error adding comment to ticket {ticket_key}: {e}")
+            return {"error": str(e)}
+
+class PRProcessingAgent(LlmAgent):
+    """Agent responsible for processing PR approvals and merging"""
+    
+    def __init__(self, gitlab_toolkit: GitLabToolkit, jira_toolkit: JiraToolkit):
+        super().__init__(
+            name="pr_processing_agent",
+            description="Processes GitLab PR approvals and handles merging",
+            model="gemini-2.0-flash",  # Updated to use Gemini 2.0 Flash
+            instruction="""
+            You are a GitLab PR and Jira integration agent. Your responsibilities are:
+            
+            1. Monitor and process GitLab merge requests
+            2. Check approval status before merging
+            3. Merge approved PRs automatically
+            4. Update corresponding Jira tickets
+            5. Extract Jira ticket IDs from branch names
+            6. Add comments and update ticket status after successful merges
+            
+            Always ensure PRs are properly approved before merging and handle errors gracefully.
+            """,
+            tools=[gitlab_toolkit, jira_toolkit]
+        )
+        
+        # Store toolkits as instance variables after initialization
+        object.__setattr__(self, 'gitlab_toolkit', gitlab_toolkit)
+        object.__setattr__(self, 'jira_toolkit', jira_toolkit)
+    
+    def process_merge_requests(self) -> List[Dict]:
+        """
+        Main method to process all open merge requests
+        
+        Returns:
+            List of processing results
+        """
+        results = []
+        
+        # Fetch open merge requests
+        mrs = self.gitlab_toolkit.fetch_merge_requests("opened")
+        
+        for mr in mrs:
+            try:
+                result = self._process_single_mr(mr)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error processing MR {mr['iid']}: {e}")
+                results.append({
+                    "mr_id": mr['iid'],
+                    "status": "error",
+                    "error": str(e)
+                })
+        
+        return results
+    
+    def _process_single_mr(self, mr: Dict) -> Dict:
+        """Process a single merge request"""
+        mr_iid = mr['iid']
+        
+        # Get approval status
+        approvals = self.gitlab_toolkit.get_merge_request_approvals(mr_iid)
+        
+        if not approvals:
+            return {
+                "mr_id": mr_iid,
+                "status": "no_approvals_data",
+                "message": "Could not fetch approval data"
+            }
+        
+        # Check if MR is approved
+        is_approved = (
+            approvals.get('approved', False) or 
+            len(approvals.get('approved_by', [])) >= approvals.get('approvals_required', 1)
+        )
+        
+        if not is_approved:
+            return {
+                "mr_id": mr_iid,
+                "status": "not_approved",
+                "message": "MR is not yet approved"
+            }
+        
+        # Check if MR can be merged
+        if mr.get('merge_status') != 'can_be_merged':
+            return {
+                "mr_id": mr_iid,
+                "status": "cannot_merge",
+                "message": f"MR cannot be merged. Status: {mr.get('merge_status')}"
+            }
+        
+        # Extract Jira ticket from branch name
+        jira_ticket = self.gitlab_toolkit.extract_jira_ticket_from_branch(
+            mr['source_branch']
+        )
+        
+        # Merge the MR
+        merge_result = self.gitlab_toolkit.merge_request(
+            mr_iid,
+            f"Merge {mr['title']} (closes #{mr_iid})"
+        )
+        
+        if "error" in merge_result:
+            return {
+                "mr_id": mr_iid,
+                "status": "merge_failed",
+                "error": merge_result["error"]
+            }
+        
+        result = {
+            "mr_id": mr_iid,
+            "status": "merged",
+            "message": "MR successfully merged",
+            "jira_ticket": jira_ticket
+        }
+        
+        # Update Jira ticket if found
+        if jira_ticket:
+            jira_result = self._update_jira_ticket(jira_ticket, mr)
+            result["jira_update"] = jira_result
+        
+        return result
+    
+    def _update_jira_ticket(self, ticket_key: str, mr: Dict) -> Dict:
+        """Update Jira ticket after successful merge"""
+        try:
+            # Add comment about the merge
+            comment = (
+                f"🎉 Merge Request Successfully Merged!\n\n"
+                f"**Title:** {mr['title']}\n"
+                f"**Branch:** {mr['source_branch']} → {mr['target_branch']}\n"
+                f"**URL:** {mr['web_url']}\n"
+                f"**Merged at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"The code changes have been successfully integrated into the main branch."
+            )
+            
+            comment_result = self.jira_toolkit.add_comment(ticket_key, comment)
+            
+            if comment_result.get("success"):
+                # Try to move ticket to "Done" or "Resolved" status
+                status_result = self.jira_toolkit.update_ticket_status(
+                    ticket_key, 
+                    "Done",
+                    "Automatically updated after successful merge"
+                )
+                
+                return {
+                    "ticket_key": ticket_key,
+                    "comment_added": True,
+                    "status_updated": status_result.get("success", False),
+                    "new_status": status_result.get("status", "unchanged")
+                }
+            else:
+                return {
+                    "ticket_key": ticket_key,
+                    "comment_added": False,
+                    "error": comment_result.get("error", "Unknown error")
+                }
+                
+        except Exception as e:
+            logger.error(f"Error updating Jira ticket {ticket_key}: {e}")
+            return {
+                "ticket_key": ticket_key,
+                "error": str(e)
+            }
+
+class GitLabJiraAgent:
+    """Main orchestration agent for GitLab-Jira integration"""
+    
+    def __init__(self):
+        # Initialize toolkits with hardcoded values
+        gitlab_toolkit = GitLabToolkit(
+            base_url=GITLAB_BASE_URL,
+            token=GITLAB_TOKEN,
+            project_id=GITLAB_PROJECT_ID
+        )
+        
+        jira_toolkit = JiraToolkit(
+            base_url=JIRA_BASE_URL,
+            username=JIRA_EMAIL,
+            api_token=JIRA_API_TOKEN
+        )
+        
+        # Initialize processing agent
+        self.pr_agent = PRProcessingAgent(gitlab_toolkit, jira_toolkit)
+    
+    def run_processing_cycle(self) -> Dict:
+        """Run a complete processing cycle"""
+        logger.info("Starting GitLab-Jira processing cycle")
+        
+        try:
+            results = self.pr_agent.process_merge_requests()
+            
+            # Summarize results
+            total_processed = len(results)
+            merged_count = len([r for r in results if r.get('status') == 'merged'])
+            error_count = len([r for r in results if r.get('status') == 'error'])
+            
+            summary = {
+                "timestamp": datetime.now().isoformat(),
+                "total_processed": total_processed,
+                "merged_count": merged_count,
+                "error_count": error_count,
+                "results": results
+            }
+            
+            logger.info(f"Processing cycle completed: {merged_count}/{total_processed} merged")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error in processing cycle: {e}")
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "error": str(e)
+            }
+
+def main():
+    """Main function to run the agent"""
+    
+    # Set environment variables for Google AI Studio (not Vertex AI)
+    os.environ['GOOGLE_GENAI_USE_VERTEXAI'] = 'FALSE'
+    
+    # Initialize and run agent
     agent = GitLabJiraAgent()
     
-    print("GitLab-Jira Integration Agent initialized successfully!")
-    print("\nAvailable commands:")
-    print("1. Execute workflow: agent.execute_workflow(project_id, mr_iid, jira_issue_key)")
-    print("2. Chat with agent: agent.chat('your message')")
-    print("\nExample usage:")
-    print("response = agent.execute_workflow('123', '45', 'PROJ-789')")
-    print("response = agent.chat('Fetch merge request 45 from project 123 and show me the diff')")
+    # Run processing cycle
+    result = agent.run_processing_cycle()
     
-    # Interactive mode
-    while True:
-        try:
-            user_input = input("\nEnter your command (or 'quit' to exit): ")
-            if user_input.lower() == 'quit':
-                break
-            
-            response = agent.chat(user_input)
-            print(f"\nAgent Response: {response}")
-            
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            break
-        except Exception as e:
-            print(f"Error: {str(e)}")
+    # Print results
+    print("\n" + "="*50)
+    print("GITLAB-JIRA AGENT RESULTS")
+    print("="*50)
+    print(json.dumps(result, indent=2))
 
 if __name__ == "__main__":
     main()
-
-"""
-USAGE EXAMPLES:
-
-1. Basic workflow execution:
-   agent = GitLabJiraAgent()
-   response = agent.execute_workflow("123", "45", "PROJ-789")
-
-2. Individual operations:
-   agent.chat("Fetch merge request 45 from project 123")
-   agent.chat("Get diff for merge request 45 in project 123")
-   agent.chat("Approve merge request 45 in project 123")
-   agent.chat("Fetch Jira ticket PROJ-789")
-   agent.chat("Update Jira ticket PROJ-789 status to 'In Progress'")
-
-3. Complex workflows:
-   agent.chat("Fetch MR 45 from project 123, analyze the diff, then update PROJ-789 accordingly")
-
-CONFIGURATION NOTES:
-- Make sure your GitLab token has appropriate permissions
-- Jira transitions vary by project configuration
-- Test with a small project first
-- Monitor API rate limits
-"""
