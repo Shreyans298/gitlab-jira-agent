@@ -269,6 +269,8 @@ class JiraToolkit(BaseToolset):
             FunctionTool(self.get_ticket_info),
             FunctionTool(self.update_ticket_status),
             FunctionTool(self.add_comment),
+            FunctionTool(self.get_available_transitions),
+            FunctionTool(self.update_ticket_status_by_transition_id),
         ]
     
     def close(self):
@@ -329,16 +331,38 @@ class JiraToolkit(BaseToolset):
                 logger.error(f"Status '{status}' not available for ticket {ticket_key}")
                 return {"error": f"Status '{status}' not available"}
             
-            # Execute transition
+            # Execute transition with proper format
             transition_data = {
-                "transition": {"id": target_transition['id']}
+                "transition": {
+                    "id": target_transition['id']
+                }
             }
             
+            # Add comment in the correct format for API v3
             if comment:
                 transition_data["update"] = {
-                    "comment": [{"add": {"body": comment}}]
+                    "comment": [{
+                        "add": {
+                            "body": {
+                                "content": [
+                                    {
+                                        "content": [
+                                            {
+                                                "text": comment,
+                                                "type": "text"
+                                            }
+                                        ],
+                                        "type": "paragraph"
+                                    }
+                                ],
+                                "type": "doc",
+                                "version": 1
+                            }
+                        }
+                    }]
                 }
             
+            logger.info(f"Executing transition {target_transition['id']} ({target_transition['name']}) for ticket {ticket_key}")
             response = requests.post(transitions_url, auth=self.auth, 
                                    headers=self.headers, json=transition_data)
             response.raise_for_status()
@@ -348,6 +372,13 @@ class JiraToolkit(BaseToolset):
             
         except requests.RequestException as e:
             logger.error(f"Error updating ticket {ticket_key}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    logger.error(f"JIRA API Error Details: {error_details}")
+                    return {"error": f"{str(e)} - Details: {error_details}"}
+                except:
+                    return {"error": str(e)}
             return {"error": str(e)}
     
     def add_comment(self, ticket_key: str, comment: str) -> Dict:
@@ -390,6 +421,83 @@ class JiraToolkit(BaseToolset):
             
         except requests.RequestException as e:
             logger.error(f"Error adding comment to ticket {ticket_key}: {e}")
+            return {"error": str(e)}
+    
+    def get_available_transitions(self, ticket_key: str) -> Dict:
+        """
+        Get available transitions for a Jira ticket (for debugging)
+        
+        Args:
+            ticket_key: The key of the Jira ticket
+            
+        Returns:
+            Dictionary containing available transitions
+        """
+        try:
+            url = f"{self.base_url}/rest/api/3/issue/{ticket_key}/transitions"
+            
+            response = requests.get(url, auth=self.auth, headers=self.headers)
+            response.raise_for_status()
+            
+            transitions_data = response.json()
+            transitions = []
+            
+            for transition in transitions_data.get('transitions', []):
+                transitions.append({
+                    'id': transition['id'],
+                    'name': transition['name'],
+                    'to_status': transition['to']['name']
+                })
+            
+            logger.info(f"Available transitions for {ticket_key}: {transitions}")
+            return {
+                "ticket_key": ticket_key,
+                "transitions": transitions
+            }
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching transitions for {ticket_key}: {e}")
+            return {"error": str(e)}
+    
+    def update_ticket_status_by_transition_id(self, ticket_key: str, transition_id: str, comment: str = None) -> Dict:
+        """
+        Update ticket status using transition ID directly
+        
+        Args:
+            ticket_key: The key of the Jira ticket
+            transition_id: The ID of the transition to execute
+            comment: Optional comment to add
+            
+        Returns:
+            Dictionary containing update result
+        """
+        try:
+            transitions_url = f"{self.base_url}/rest/api/3/issue/{ticket_key}/transitions"
+            
+            # Execute transition with minimal data
+            transition_data = {
+                "transition": {
+                    "id": transition_id
+                }
+            }
+            
+            logger.info(f"Executing transition ID {transition_id} for ticket {ticket_key}")
+            response = requests.post(transitions_url, auth=self.auth, 
+                                   headers=self.headers, json=transition_data)
+            response.raise_for_status()
+            
+            logger.info(f"Successfully executed transition {transition_id} for ticket {ticket_key}")
+            return {"success": True, "transition_id": transition_id}
+            
+        except requests.RequestException as e:
+            logger.error(f"Error executing transition {transition_id} for ticket {ticket_key}: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    logger.error(f"JIRA API Error Details: {error_details}")
+                    return {"error": f"{str(e)} - Details: {error_details}"}
+                except:
+                    return {"error": str(e)}
             return {"error": str(e)}
 
 class PRProcessingAgent(LlmAgent):
@@ -544,25 +652,40 @@ class PRProcessingAgent(LlmAgent):
             "mr_id": mr_iid,
             "status": "merged",
             "message": "MR successfully merged",
-            "jira_ticket": jira_ticket
+            "jira_ticket": "SUP-125"  # Hardcoded ticket
         }
         
-        # Update Jira ticket if found
-        if jira_ticket:
-            print(f"🎫 Updating Jira ticket {jira_ticket}...")
-            jira_result = self._update_jira_ticket(jira_ticket, mr)
-            result["jira_update"] = jira_result
-            
-            if jira_result.get("comment_added"):
-                print(f"✅ Jira ticket {jira_ticket} updated successfully!")
-            else:
-                print(f"⚠️  Failed to update Jira ticket {jira_ticket}")
+        # Always update the hardcoded Jira ticket SUP-125
+        print(f"🎫 Updating Jira ticket SUP-125...")
+        jira_result = self._update_jira_ticket("SUP-125", mr)
+        result["jira_update"] = jira_result
+        
+        if jira_result.get("comment_added") or jira_result.get("status_updated"):
+            print(f"✅ Jira ticket SUP-125 updated successfully!")
+        else:
+            print(f"⚠️  Failed to update Jira ticket SUP-125: {jira_result.get('error', 'Unknown error')}")
         
         return result
     
     def _update_jira_ticket(self, ticket_key: str, mr: Dict) -> Dict:
         """Update Jira ticket after successful merge"""
         try:
+            # First, check what transitions are available for debugging
+            print(f"🔍 Checking available transitions for {ticket_key}...")
+            transitions_info = self.jira_toolkit.get_available_transitions(ticket_key)
+            
+            if transitions_info.get("error"):
+                print(f"❌ Error checking transitions: {transitions_info['error']}")
+                return {
+                    "ticket_key": ticket_key,
+                    "error": f"Cannot access ticket transitions: {transitions_info['error']}"
+                }
+            
+            available_transitions = transitions_info.get("transitions", [])
+            print(f"📋 Available transitions for {ticket_key}:")
+            for transition in available_transitions:
+                print(f"   • {transition['name']} → {transition['to_status']}")
+            
             # Add comment about the merge
             comment = (
                 f"🎉 Merge Request Successfully Merged!\n\n"
@@ -573,28 +696,68 @@ class PRProcessingAgent(LlmAgent):
                 f"The code changes have been successfully integrated into the main branch."
             )
             
+            print(f"📝 Adding comment to {ticket_key}...")
             comment_result = self.jira_toolkit.add_comment(ticket_key, comment)
             
-            if comment_result.get("success"):
-                # Try to move ticket to "Done" or "Resolved" status
-                status_result = self.jira_toolkit.update_ticket_status(
+            # Try to find a suitable completion status from available transitions
+            completion_statuses = ["Done", "Completed", "Closed", "Resolved", "Complete"]
+            status_result = {"success": False}
+            
+            # First, try to find "Mark as done" transition specifically (ID 61 from the output)
+            mark_as_done_transition = None
+            for transition in available_transitions:
+                if transition['name'].lower() == 'mark as done' or transition['to_status'].lower() == 'done':
+                    mark_as_done_transition = transition
+                    break
+            
+            if mark_as_done_transition:
+                print(f"🔄 Using direct transition '{mark_as_done_transition['name']}' (ID: {mark_as_done_transition['id']})...")
+                status_result = self.jira_toolkit.update_ticket_status_by_transition_id(
                     ticket_key, 
-                    "Done",
-                    "Automatically updated after successful merge"
+                    mark_as_done_transition['id']
                 )
-                
-                return {
-                    "ticket_key": ticket_key,
-                    "comment_added": True,
-                    "status_updated": status_result.get("success", False),
-                    "new_status": status_result.get("status", "unchanged")
-                }
-            else:
-                return {
-                    "ticket_key": ticket_key,
-                    "comment_added": False,
-                    "error": comment_result.get("error", "Unknown error")
-                }
+                if status_result.get("success"):
+                    print(f"✅ Successfully executed transition '{mark_as_done_transition['name']}'")
+                else:
+                    print(f"⚠️  Failed to execute transition '{mark_as_done_transition['name']}': {status_result.get('error', 'Unknown error')}")
+            
+            # If direct transition failed, try the old method
+            if not status_result.get("success"):
+                for status in completion_statuses:
+                    # Check if this status is available in transitions
+                    matching_transition = None
+                    for transition in available_transitions:
+                        if transition['to_status'].lower() == status.lower():
+                            matching_transition = transition
+                            break
+                    
+                    if matching_transition:
+                        print(f"🔄 Updating {ticket_key} status to '{matching_transition['to_status']}'...")
+                        status_result = self.jira_toolkit.update_ticket_status(
+                            ticket_key, 
+                            matching_transition['to_status'],
+                            "Automatically updated after successful merge"
+                        )
+                        if status_result.get("success"):
+                            print(f"✅ Successfully updated status to '{matching_transition['to_status']}'")
+                            break
+                        else:
+                            print(f"⚠️  Failed to update to '{matching_transition['to_status']}': {status_result.get('error', 'Unknown error')}")
+            
+            if not status_result.get("success"):
+                print(f"⚠️  Could not find suitable completion status. Available transitions:")
+                for transition in available_transitions:
+                    print(f"     • {transition['name']} → {transition['to_status']}")
+            
+            return {
+                "ticket_key": ticket_key,
+                "comment_added": comment_result.get("success", False),
+                "status_updated": status_result.get("success", False),
+                "new_status": status_result.get("status", status_result.get("transition_id", "unchanged")),
+                "available_transitions": [t['to_status'] for t in available_transitions],
+                "comment_error": comment_result.get("error") if not comment_result.get("success") else None,
+                "status_error": status_result.get("error") if not status_result.get("success") else None
+            }
                 
         except Exception as e:
             logger.error(f"Error updating Jira ticket {ticket_key}: {e}")
