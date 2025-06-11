@@ -3,9 +3,10 @@ GitLab PR & Jira Integration Agent using Google ADK
 
 This agent:
 1. Fetches PR requests from GitLab
-2. Checks if PRs are approved
-3. Merges approved PRs
-4. Updates corresponding Jira tickets
+2. Shows merge diffs in terminal
+3. Asks for manual approval (Yes/No)
+4. Merges approved PRs
+5. Updates corresponding Jira tickets
 
 Requirements:
 pip install google-adk requests python-dotenv
@@ -88,6 +89,7 @@ class GitLabToolkit(BaseToolset):
         return [
             FunctionTool(self.fetch_merge_requests),
             FunctionTool(self.get_merge_request_approvals),
+            FunctionTool(self.get_merge_request_diff),
             FunctionTool(self.merge_request),
             FunctionTool(self.extract_jira_ticket_from_branch),
         ]
@@ -145,6 +147,54 @@ class GitLabToolkit(BaseToolset):
             logger.error(f"Error fetching approvals for MR {mr_iid}: {e}")
             return {}
     
+    def get_merge_request_diff(self, mr_iid: int) -> str:
+        """
+        Get the diff/changes for a specific merge request
+        
+        Args:
+            mr_iid: The IID of the merge request
+            
+        Returns:
+            String containing the diff content
+        """
+        try:
+            url = f"{self.base_url}/api/v4/projects/{self.project_id}/merge_requests/{mr_iid}/changes"
+            
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            changes = response.json()
+            
+            # Format the diff for terminal display
+            diff_output = []
+            diff_output.append(f"\n{'='*80}")
+            diff_output.append(f"MERGE REQUEST DIFF - MR #{mr_iid}")
+            diff_output.append(f"{'='*80}")
+            
+            if 'changes' in changes:
+                for change in changes['changes']:
+                    diff_output.append(f"\nFile: {change.get('new_path', change.get('old_path', 'Unknown'))}")
+                    diff_output.append("-" * 60)
+                    
+                    if change.get('diff'):
+                        diff_output.append(change['diff'])
+                    else:
+                        diff_output.append("Binary file or no changes to display")
+                    
+                    diff_output.append("")
+            else:
+                diff_output.append("No changes found in this merge request")
+            
+            diff_output.append(f"{'='*80}\n")
+            
+            diff_text = "\n".join(diff_output)
+            logger.info(f"Fetched diff for MR {mr_iid}")
+            return diff_text
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching diff for MR {mr_iid}: {e}")
+            return f"Error fetching diff: {e}"
+    
     def merge_request(self, mr_iid: int, commit_message: str = None) -> Dict:
         """
         Merge a specific merge request
@@ -176,7 +226,7 @@ class GitLabToolkit(BaseToolset):
     
     def extract_jira_ticket_from_branch(self, branch_name: str) -> Optional[str]:
         """
-        Extract Jira ticket key from branch name
+        Extract Jira ticket key from branch name for SUP project
         
         Args:
             branch_name: The name of the branch
@@ -186,10 +236,10 @@ class GitLabToolkit(BaseToolset):
         """
         import re
         
-        # Common patterns for Jira tickets in branch names
+        # Patterns specifically for SUP project
         patterns = [
-            r'([A-Z]{2,}-\d+)',  # Standard format: ABC-123
-            r'([A-Z]{2,}_\d+)',  # Underscore format: ABC_123
+            r'(SUP-\d+)',  # Standard format: SUP-123
+            r'(SUP_\d+)',  # Underscore format: SUP_123
         ]
         
         for pattern in patterns:
@@ -348,19 +398,20 @@ class PRProcessingAgent(LlmAgent):
     def __init__(self, gitlab_toolkit: GitLabToolkit, jira_toolkit: JiraToolkit):
         super().__init__(
             name="pr_processing_agent",
-            description="Processes GitLab PR approvals and handles merging",
+            description="Processes GitLab PR approvals and handles merging with manual approval",
             model="gemini-2.0-flash",  # Updated to use Gemini 2.0 Flash
             instruction="""
             You are a GitLab PR and Jira integration agent. Your responsibilities are:
             
             1. Monitor and process GitLab merge requests
-            2. Check approval status before merging
-            3. Merge approved PRs automatically
-            4. Update corresponding Jira tickets
-            5. Extract Jira ticket IDs from branch names
-            6. Add comments and update ticket status after successful merges
+            2. Display merge request diffs in terminal
+            3. Ask for manual approval before merging
+            4. Merge approved PRs automatically
+            5. Update corresponding Jira tickets (SUP project)
+            6. Extract Jira ticket IDs from branch names
+            7. Add comments and update ticket status after successful merges
             
-            Always ensure PRs are properly approved before merging and handle errors gracefully.
+            Always show diffs and ask for manual approval before merging.
             """,
             tools=[gitlab_toolkit, jira_toolkit]
         )
@@ -371,7 +422,7 @@ class PRProcessingAgent(LlmAgent):
     
     def process_merge_requests(self) -> List[Dict]:
         """
-        Main method to process all open merge requests
+        Main method to process all open merge requests with manual approval
         
         Returns:
             List of processing results
@@ -381,10 +432,26 @@ class PRProcessingAgent(LlmAgent):
         # Fetch open merge requests
         mrs = self.gitlab_toolkit.fetch_merge_requests("opened")
         
-        for mr in mrs:
+        if not mrs:
+            print("\n🔍 No open merge requests found.")
+            return []
+        
+        print(f"\n📋 Found {len(mrs)} open merge request(s)")
+        
+        for i, mr in enumerate(mrs, 1):
             try:
+                print(f"\n{'='*80}")
+                print(f"PROCESSING MERGE REQUEST {i}/{len(mrs)}")
+                print(f"{'='*80}")
+                
                 result = self._process_single_mr(mr)
                 results.append(result)
+                
+                # If user rejected, stop processing remaining MRs
+                if result.get('status') == 'user_rejected':
+                    print(f"\n⏹️  Stopping processing of remaining merge requests.")
+                    break
+                    
             except Exception as e:
                 logger.error(f"Error processing MR {mr['iid']}: {e}")
                 results.append({
@@ -396,57 +463,82 @@ class PRProcessingAgent(LlmAgent):
         return results
     
     def _process_single_mr(self, mr: Dict) -> Dict:
-        """Process a single merge request"""
+        """Process a single merge request with manual approval"""
         mr_iid = mr['iid']
         
-        # Get approval status
-        approvals = self.gitlab_toolkit.get_merge_request_approvals(mr_iid)
-        
-        if not approvals:
-            return {
-                "mr_id": mr_iid,
-                "status": "no_approvals_data",
-                "message": "Could not fetch approval data"
-            }
-        
-        # Check if MR is approved
-        is_approved = (
-            approvals.get('approved', False) or 
-            len(approvals.get('approved_by', [])) >= approvals.get('approvals_required', 1)
-        )
-        
-        if not is_approved:
-            return {
-                "mr_id": mr_iid,
-                "status": "not_approved",
-                "message": "MR is not yet approved"
-            }
-        
-        # Check if MR can be merged
-        if mr.get('merge_status') != 'can_be_merged':
-            return {
-                "mr_id": mr_iid,
-                "status": "cannot_merge",
-                "message": f"MR cannot be merged. Status: {mr.get('merge_status')}"
-            }
+        print(f"\n📄 MR #{mr_iid}: {mr['title']}")
+        print(f"👤 Author: {mr['author']['name']}")
+        print(f"🌿 Source: {mr['source_branch']} → {mr['target_branch']}")
+        print(f"🔗 URL: {mr['web_url']}")
         
         # Extract Jira ticket from branch name
         jira_ticket = self.gitlab_toolkit.extract_jira_ticket_from_branch(
             mr['source_branch']
         )
         
+        if jira_ticket:
+            print(f"🎫 Jira Ticket: {jira_ticket}")
+        else:
+            print("⚠️  No Jira ticket found in branch name")
+        
+        # Check if MR can be merged
+        if mr.get('merge_status') != 'can_be_merged':
+            print(f"❌ Cannot merge: {mr.get('merge_status')}")
+            return {
+                "mr_id": mr_iid,
+                "status": "cannot_merge",
+                "message": f"MR cannot be merged. Status: {mr.get('merge_status')}"
+            }
+        
+        # Get and display the diff
+        print(f"\n🔍 Fetching merge request diff...")
+        diff = self.gitlab_toolkit.get_merge_request_diff(mr_iid)
+        print(diff)
+        
+        # Ask for manual approval
+        while True:
+            try:
+                approval = input("🤔 Do you want to merge this MR? (yes/y/no/n): ").strip().lower()
+                if approval in ['yes', 'y']:
+                    approved = True
+                    break
+                elif approval in ['no', 'n']:
+                    approved = False
+                    break
+                else:
+                    print("⚠️  Please enter 'yes', 'y', 'no', or 'n'")
+            except KeyboardInterrupt:
+                print(f"\n\n⏹️  Process interrupted by user")
+                return {
+                    "mr_id": mr_iid,
+                    "status": "interrupted",
+                    "message": "Process interrupted by user"
+                }
+        
+        if not approved:
+            print(f"❌ MR #{mr_iid} rejected by user")
+            return {
+                "mr_id": mr_iid,
+                "status": "user_rejected",
+                "message": "MR rejected by user"
+            }
+        
         # Merge the MR
+        print(f"\n🔄 Merging MR #{mr_iid}...")
         merge_result = self.gitlab_toolkit.merge_request(
             mr_iid,
             f"Merge {mr['title']} (closes #{mr_iid})"
         )
         
         if "error" in merge_result:
+            print(f"❌ Merge failed: {merge_result['error']}")
             return {
                 "mr_id": mr_iid,
                 "status": "merge_failed",
                 "error": merge_result["error"]
             }
+        
+        print(f"✅ MR #{mr_iid} successfully merged!")
         
         result = {
             "mr_id": mr_iid,
@@ -457,8 +549,14 @@ class PRProcessingAgent(LlmAgent):
         
         # Update Jira ticket if found
         if jira_ticket:
+            print(f"🎫 Updating Jira ticket {jira_ticket}...")
             jira_result = self._update_jira_ticket(jira_ticket, mr)
             result["jira_update"] = jira_result
+            
+            if jira_result.get("comment_added"):
+                print(f"✅ Jira ticket {jira_ticket} updated successfully!")
+            else:
+                print(f"⚠️  Failed to update Jira ticket {jira_ticket}")
         
         return result
     
@@ -558,8 +656,15 @@ class GitLabJiraAgent:
 def main():
     """Main function to run the agent"""
     
-    # Set environment variables for Google AI Studio (not Vertex AI)
     os.environ['GOOGLE_GENAI_USE_VERTEXAI'] = 'FALSE'
+    
+    print("🚀 Starting GitLab-Jira Integration Agent")
+    print("This agent will:")
+    print("  1. Fetch open merge requests from GitLab")
+    print("  2. Show merge diffs in terminal")
+    print("  3. Ask for your approval before merging")
+    print("  4. Update corresponding SUP Jira tickets")
+    print(f"{'='*80}")
     
     # Initialize and run agent
     agent = GitLabJiraAgent()
@@ -567,11 +672,37 @@ def main():
     # Run processing cycle
     result = agent.run_processing_cycle()
     
-    # Print results
-    print("\n" + "="*50)
-    print("GITLAB-JIRA AGENT RESULTS")
-    print("="*50)
-    print(json.dumps(result, indent=2))
+    # Print final results
+    print("\n" + "="*80)
+    print("🏁 GITLAB-JIRA AGENT FINAL RESULTS")
+    print("="*80)
+    
+    if result.get("error"):
+        print(f"❌ Error occurred: {result['error']}")
+    else:
+        print(f"📊 Total processed: {result.get('total_processed', 0)}")
+        print(f"✅ Successfully merged: {result.get('merged_count', 0)}")
+        print(f"❌ Errors: {result.get('error_count', 0)}")
+        
+        # Show detailed results
+        for mr_result in result.get('results', []):
+            mr_id = mr_result.get('mr_id')
+            status = mr_result.get('status')
+            
+            if status == 'merged':
+                print(f"  ✅ MR #{mr_id}: Merged successfully")
+                if mr_result.get('jira_ticket'):
+                    jira_status = "✅" if mr_result.get('jira_update', {}).get('comment_added') else "⚠️"
+                    print(f"    {jira_status} Jira: {mr_result['jira_ticket']}")
+            elif status == 'user_rejected':
+                print(f"  ❌ MR #{mr_id}: Rejected by user")
+            elif status == 'cannot_merge':
+                print(f"  ⚠️  MR #{mr_id}: Cannot be merged")
+            elif status == 'error':
+                print(f"  ❌ MR #{mr_id}: Error - {mr_result.get('error', 'Unknown error')}")
+    
+    print(f"{'='*80}")
+    print("🎉 GitLab-Jira Agent completed!")
 
 if __name__ == "__main__":
     main()
